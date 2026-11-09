@@ -29,12 +29,14 @@ class GenerateWorkflowsCommand extends AmplifyCommand {
 
   final _dependabotDirectories = <String>{};
 
+  final _writtenFiles = <String>{};
+
   late final StringBuffer _dependabotConfig = () {
     final groupPubPackages = repo.aftConfig.dependencies.keys
         .map(_dependabotGroup)
         .join('\n');
     return StringBuffer('''
-# Generated with aft. To update, run: `aft generate workflows`
+$generatedHeader
 version: 2
 enable-beta-ecosystems: true
 updates:
@@ -191,27 +193,44 @@ ${dependabotGroups.join('\n')}
       p.join(rootDir.path, '.github', 'dependabot.yaml'),
     );
     writeWorkflowFile(dependabotFile, _dependabotConfig.toString());
+    _deleteStaleWorkflows();
 
-    // Check if workflow generation caused `git diff` to change.
     if (setExitIfChanged) {
-      final gitDiff = await Process.start('git', [
-        'diff',
-        '--relative',
+      // `git status` (unlike `git diff`) also reports untracked files, so a
+      // newly generated workflow is caught too.
+      final status = await repo.git.runCommand([
+        'status',
+        '--porcelain',
+        '--untracked-files=all',
         '--',
-        '.github/workflows',
-      ], workingDirectory: rootDir.path);
+        ...generatedPaths,
+      ]);
+      final changes = status.stdout as String;
+      if (changes.isNotEmpty) {
+        exitError(
+          'Workflows are not up to date:\n$changes'
+          'Run `aft generate workflows` and commit the result.',
+        );
+      }
+    }
+  }
 
-      final gitDiffOutput = StringBuffer();
-      gitDiff
-        ..captureStdout()
-        ..captureStdout(sink: gitDiffOutput.write)
-        ..captureStderr()
-        ..captureStderr(sink: gitDiffOutput.write);
-      if (await gitDiff.exitCode != 0 || gitDiffOutput.isNotEmpty) {
-        logger
-          ..error('Workflows are not up to date.')
-          ..error('Run `aft generate workflows` to regenerate them.');
-        exit(1);
+  /// Deletes generated workflows which no package produced in this run, e.g.
+  /// after a package was removed or renamed.
+  void _deleteStaleWorkflows() {
+    final workflowsDir = Directory(
+      p.join(rootDir.path, '.github', 'workflows'),
+    );
+    if (!workflowsDir.existsSync()) {
+      return;
+    }
+    for (final file in workflowsDir.listSync().whereType<File>()) {
+      if (_writtenFiles.contains(file.path)) {
+        continue;
+      }
+      if (file.readAsLinesSync().firstOrNull == generatedHeader) {
+        logger.info('Deleting stale workflow: ${file.path}');
+        file.deleteSync();
       }
     }
   }
@@ -259,6 +278,8 @@ ${dependabotGroups.join('\n')}
           'file was found at: $workflowFilepath',
         );
       }
+      // A custom workflow is kept whether or not it carries the header.
+      _writtenFiles.add(workflowFile.path);
       return;
     }
     final isDartPackage = package.flavor == PackageFlavor.dart;
@@ -362,7 +383,7 @@ ${dependabotGroups.join('\n')}
     workflowPaths.sort();
 
     final workflowContents = StringBuffer('''
-# Generated with aft. To update, run: `aft generate workflows`
+$generatedHeader
 name: ${package.name}
 on:
   push:
@@ -589,7 +610,7 @@ jobs:
     final androidWorkflowFile = File(androidWorkflowFilepath);
     final androidWorkflowContents =
         '''
-# Generated with aft. To update, run: `aft generate workflows`
+$generatedHeader
 name: ${package.name} Android
 on:
   push:
@@ -666,7 +687,7 @@ jobs:
     final iosWorkflowFile = File(workflowFilepath);
     final iosWorkflowContents =
         '''
-# Generated with aft. To update, run: `aft generate workflows`
+$generatedHeader
 name: ${package.name} iOS
 on:
   push:
@@ -774,12 +795,28 @@ jobs:
   }
 
   void writeWorkflowFile(File workflowFile, String content) {
+    final relativePath = p.relative(workflowFile.path, from: rootDir.path);
+    if (!generatedPaths.any((path) => p.isWithin(path, relativePath)) &&
+        !generatedPaths.contains(relativePath)) {
+      throw StateError(
+        '$relativePath is outside the paths checked by '
+        '`--set-exit-if-changed`: $generatedPaths',
+      );
+    }
+    _writtenFiles.add(workflowFile.path);
     if (!workflowFile.existsSync()) {
       workflowFile.createSync();
     }
     workflowFile.writeAsStringSync(content);
   }
 }
+
+/// First line of every file written by `aft generate workflows`.
+const generatedHeader =
+    '# Generated with aft. To update, run: `aft generate workflows`';
+
+/// Repo-relative paths written by `aft generate workflows`.
+const generatedPaths = ['.github/workflows', '.github/dependabot.yaml'];
 
 const permissionsBlock = '''
 # These permissions are needed to interact with GitHub's OIDC Token endpoint.
